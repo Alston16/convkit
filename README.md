@@ -13,7 +13,7 @@ Most chat backends treat bots as afterthoughts. They handle messaging well but l
 |---|---|
 | Message delivery | **Streaming token delivery** (delta protocol) |
 | Static message history | **Context window management** (memory tiers, RAG injection) |
-| Webhook on message | **Tool / function calling runtime** (schema registry, sandboxed execution) |
+| Webhook on message | **Tool / function calling runtime** (schema registry, timeout-isolated execution) |
 | One bot per integration | **Multi-agent orchestration** (supervisor/worker topologies, shared memory) |
 | Content moderation (maybe) | **Safety plane across every layer** (PII, injection attacks, policy enforcement) |
 
@@ -34,7 +34,7 @@ ConvKit is structured as six layers, each owning a distinct responsibility. Laye
 │  Multi-agent rooms · Supervisor/worker · Shared memory      │
 ├─────────────────────────────────────────────────────────────┤
 │  Layer 5 — Tool Runtime                                     │
-│  Schema registry · Sandboxed execution · Result injection   │
+│  Schema registry · Timeout-isolated execution · Result injection │
 ├─────────────────────────────────────────────────────────────┤
 │  Layer 4 — Context Engine                                   │
 │  Window mgmt · Memory tiers · RAG injection · Token budget  │
@@ -46,13 +46,19 @@ ConvKit is structured as six layers, each owning a distinct responsibility. Laye
 │  Fan-out · Ordering · Delivery guarantees · Presence        │
 ├─────────────────────────────────────────────────────────────┤
 │  Layer 1 — Transport                                        │
-│  WebSocket · REST · gRPC · Auth · Rate limiting             │
+│  WebSocket · REST · Auth · Rate limiting                    │
 └─────────────────────────────────────────────────────────────┘
 ```
 
+### Single-Binary Design
+
+ConvKit runs as a **single server process**. All six layers live in one binary; concurrency within the process (goroutines, channels, in-process pub/sub) handles room isolation and fan-out without a network hop. NATS JetStream is still used for durable message persistence and replay — it just isn't bridging two separate services.
+
+This keeps local development simple (`make dev` starts one server process plus Redis, Postgres, and NATS), eliminates an entire class of distributed systems complexity from V1, and defers horizontal scaling concerns until load actually demands it. When it does, the clean internal package boundaries make it straightforward to split layers across nodes — the interfaces are already defined, you're just adding a network boundary between them.
+
 ### Message Lifecycle
 
-Every message — human or agent — flows through the same pipeline:
+Every message — human or agent — flows through the same in-process pipeline:
 
 ```
 User message
@@ -68,18 +74,21 @@ LLM inference (provider-agnostic)
       │
       ├── tool call ──► Tool runtime ──► re-enter with result ──┐
       │                                                         │
-      └── text/stream ──► Streaming engine ──► delta → client ──┤
-                                                                │
-                                                                ▼
-                                                   Safety plane (outbound)
+      └── text/stream ──► Streaming engine ──► Safety plane (outbound, per-token rolling check)
+                                                    │
+                                                    ▼
+                                               delta → client
 ```
 
-### Intra-Service Communication
+> **Note on outbound safety and streaming:** Outbound safety filters run on a rolling window of accumulated tokens as the stream progresses — not as a post-hoc check after full delivery. This avoids buffering the entire response before the client sees anything, while still catching policy violations before they reach the client. Filters that require the full response (e.g. holistic coherence checks) should be applied at stream close.
 
-- **Coordinator ↔ Agents**: gRPC via `google.golang.org/grpc`
-- **Message fan-out**: NATS JetStream (or Redis Streams as a drop-in)
+### Internal Communication
+
+- **In-process layer communication**: direct Go function calls across packages — no network boundary
+- **Message fan-out to WebSocket clients**: NATS JetStream (`rooms.{roomID}.messages`)
 - **Presence / session state**: Redis (TTL-keyed)
 - **Durable message store**: PostgreSQL
+- **Database migrations**: `github.com/pressly/goose` — all schema changes are versioned and applied on startup
 
 ---
 
@@ -88,25 +97,24 @@ LLM inference (provider-agnostic)
 ```
 convkit/
 ├── cmd/
-│   ├── coordinator/        # Coordinator node entrypoint
-│   ├── shard/              # Agent/room shard node entrypoint
+│   ├── server/             # Single server entrypoint
 │   └── cli/                # Developer CLI (room management, bot registration)
 ├── internal/
-│   ├── transport/          # Layer 1: WebSocket, REST, gRPC handlers
+│   ├── transport/          # Layer 1: WebSocket, REST handlers
 │   ├── bus/                # Layer 2: Message bus, fan-out, presence
 │   ├── stream/             # Layer 3: SSE delta engine, backpressure
 │   ├── context/            # Layer 4: Context engine, memory tiers, RAG
-│   ├── tools/              # Layer 5: Tool runtime, schema registry, sandbox
+│   ├── tools/              # Layer 5: Tool runtime, schema registry
 │   ├── orchestration/      # Layer 6: Multi-agent rooms, supervisor, memory graph
-│   └── safety/             # Safety plane middleware (bidirectional)
+│   └── safety/             # Safety plane middleware (bidirectional, no-op in Stage 0)
 ├── pkg/
 │   ├── sdk/                # Public Go SDK (what application developers import)
-│   └── proto/              # Protobuf definitions for all inter-service RPCs
+│   └── tokenizer/          # Pluggable tokenizer interface + per-model implementations
+├── migrations/             # goose SQL migration files
 ├── config/
-│   ├── coordinator.yaml
-│   └── shard.yaml
+│   └── server.yaml
 ├── deploy/
-│   ├── docker-compose.yml  # Local 3-node cluster for development
+│   ├── docker-compose.yml  # Local dev: server + Redis + Postgres + NATS
 │   └── k8s/                # Kubernetes manifests
 ├── benchmarks/             # Latency, throughput, and recall benchmarks
 └── docs/
@@ -125,16 +133,20 @@ module github.com/yourorg/convkit
 go 1.23
 
 require (
-    google.golang.org/grpc              v1.64.0
-    nhooyr.io/websocket                 v1.8.11
-    github.com/nats-io/nats.go          v1.36.0
-    github.com/redis/go-redis/v9        v9.5.0
-    github.com/jackc/pgx/v5             v5.6.0
-    go.opentelemetry.io/otel            v1.27.0
-    github.com/prometheus/client_golang v1.19.0
-    github.com/rs/zerolog               v1.33.0
+    github.com/coder/websocket                v1.8.12
+    github.com/nats-io/nats.go               v1.36.0
+    github.com/redis/go-redis/v9             v9.5.0
+    github.com/jackc/pgx/v5                  v5.6.0
+    github.com/pressly/goose/v3              v3.20.0
+    go.opentelemetry.io/otel                 v1.27.0
+    github.com/prometheus/client_golang      v1.19.0
+    github.com/rs/zerolog                    v1.33.0
 )
 ```
+
+> `github.com/coder/websocket` is used in place of `nhooyr.io/websocket`. It is the actively maintained fork by the same original author and is API-compatible. `nhooyr.io/websocket` is no longer actively maintained.
+
+> `google.golang.org/grpc` is not required in V1. gRPC remains an option for the external SDK transport, but there is no inter-service RPC in the single-binary design.
 
 ---
 
@@ -178,27 +190,31 @@ bot.Start()
 
 ## Staging Plan
 
-The build is structured in seven stages. Each stage ships a working, testable artifact. Stages 0–2 cover the commodity foundation. Stages 3–7 are the AI-native layers that constitute ConvKit's core value.
+The build is structured in eight stages. Each stage ships a working, testable artifact. Stages 0–2 cover the foundation. Stages 3–7 are the AI-native layers that constitute ConvKit's core value.
+
+The safety plane is introduced as a **no-op passthrough in Stage 0** so every subsequent layer plugs into it from day one. It is fully implemented in Stage 7.
 
 ---
 
 ### Stage 0 — Project Bootstrap
 
-**Goal:** Working repository, shared types, health-checked inter-node communication.
+**Goal:** Working repository, shared types, and a safety plane skeleton that every later layer can plug into from the start.
 
 **Deliverables:**
-- [ ] Go workspace initialised with modules: `coordinator`, `shard`, `common`, `sdk`
-- [ ] Core domain types defined in `common`:
+- [ ] Go module initialised: `github.com/yourorg/convkit`
+- [ ] Core domain types defined in `internal/common`:
   - `RoomID`, `UserID`, `BotID`, `MessageID`
   - `Message{ID, RoomID, SenderID, Body, CreatedAt, Metadata}`
   - `StreamToken{MessageID, Delta, Index, Done}`
   - `ToolCall{ID, Name, Arguments json.RawMessage}`
   - `ToolResult{CallID, Output json.RawMessage, Error string}`
-- [ ] gRPC service skeleton (`coordinator.proto`, `shard.proto`) with `Health/Ping` RPC
-- [ ] Docker Compose environment: coordinator + 1 shard + Redis + Postgres + NATS
+- [ ] **Safety plane skeleton** in `internal/safety`: `SafetyPipeline` interface defined; default implementation is a no-op passthrough. All layers will call `RunInbound` / `RunOutbound` from their first commit — the no-op means no behaviour change until Stage 7.
+- [ ] **Pluggable tokenizer interface** in `pkg/tokenizer`: `Tokenizer` interface with `CountTokens(model, text string) int`. Implementations for OpenAI (tiktoken-go) and a character-estimate fallback. Model ID selects the implementation at runtime.
+- [ ] **Migration baseline**: `goose` configured; initial empty schema migration in `migrations/`.
+- [ ] Docker Compose environment: single server + Redis + Postgres + NATS
 - [ ] `make dev` brings the full environment up; `make test` runs all unit tests
 
-**Definition of done:** `go test ./...` passes. Coordinator pings shard over gRPC. Health endpoint returns `200 OK`.
+**Definition of done:** `go test ./...` passes. Server process starts and the health endpoint returns `200 OK`. Safety plane no-op passthrough is callable from all layer stubs.
 
 ---
 
@@ -207,11 +223,11 @@ The build is structured in seven stages. Each stage ships a working, testable ar
 **Goal:** Clients can connect over WebSocket and REST. All connections are authenticated and rate-limited.
 
 **Scope:**
-- [ ] WebSocket handler (`nhooyr.io/websocket`) — one goroutine per connection, context-cancelled on disconnect
+- [ ] WebSocket handler (`github.com/coder/websocket`) — one goroutine per connection, context-cancelled on disconnect
 - [ ] REST API for room CRUD, message history fetch, bot registration
 - [ ] Auth middleware: JWT (HS256 for development, RS256 for production) and API key (hashed, stored in Postgres)
 - [ ] Per-connection rate limiter using a token bucket (`golang.org/x/time/rate`)
-- [ ] gRPC reflection enabled for tooling
+- [ ] All inbound messages pass through `safety.RunInbound` (no-op at this stage)
 
 **Key interfaces:**
 ```go
@@ -234,23 +250,21 @@ type MessageHandler func(ctx context.Context, conn Connection, msg RawMessage) e
 
 ### Stage 2 — Layer 2: Message Bus
 
-**Goal:** Messages are durably stored, fan-out to all room subscribers, with presence and ordering guarantees.
+**Goal:** Messages are durably stored and fan out to all room subscribers, with presence and ordering guarantees.
 
 **Scope:**
 - [ ] NATS JetStream subject layout: `rooms.{roomID}.messages`, `rooms.{roomID}.presence`
-- [ ] Message storage: Postgres `messages` table with `(room_id, seq_num, sender_id, body, created_at)`
-- [ ] Fan-out: coordinator publishes to NATS; shard nodes subscribe and forward to connected WebSocket clients
+- [ ] Message storage: Postgres `messages` table with `(room_id, seq_num, sender_id, body, created_at)` — added via goose migration
+- [ ] Fan-out: server publishes to NATS; a subscriber goroutine per room forwards to connected WebSocket clients
 - [ ] Presence service: Redis `SETEX rooms:{roomID}:users:{userID} 30` — heartbeat every 10s
 - [ ] Typing indicators: ephemeral NATS publish, no persistence, TTL 3s
-- [ ] Read receipts: stored in Postgres `receipts(message_id, user_id, read_at)`
-- [ ] Message ordering: monotonic `seq_num` per room, assigned by coordinator
+- [ ] Message ordering: monotonic `seq_num` per room, assigned at write time
 
 **Key interfaces:**
 ```go
 type Bus interface {
     Publish(ctx context.Context, roomID RoomID, msg Message) error
     Subscribe(ctx context.Context, roomID RoomID) (<-chan Message, error)
-    Ack(ctx context.Context, messageID MessageID, userID UserID) error
 }
 
 type PresenceService interface {
@@ -261,7 +275,7 @@ type PresenceService interface {
 ```
 
 **Tests:**
-- [ ] Insert 1,000 messages into a room; verify seq_num monotonicity
+- [ ] Insert 1,000 messages into a room; verify `seq_num` monotonicity
 - [ ] 3 subscribers on the same room all receive the same message within 50ms
 - [ ] Presence expires correctly after heartbeat stops
 
@@ -278,7 +292,7 @@ type PresenceService interface {
 - [ ] `io.Pipe`-based streaming: LLM goroutine writes tokens; streaming engine goroutine reads and forwards. If the client is slow, the write blocks (backpressure) rather than buffering unboundedly.
 - [ ] **Reconnect with replay**: token log stored in Redis as a sorted set `stream:{messageID}:tokens` with score = index, TTL = 5 minutes. On reconnect, client sends `last_index`; server replays from that index.
 - [ ] Typing indicator automation: streaming engine emits a `typing=true` presence event when a stream opens, clears it when done.
-- [ ] Mid-stream edit: a `StreamEdit` message type allows replacing already-sent tokens (for self-correction). Client applies as a diff.
+- [ ] All outbound tokens pass through `safety.RunOutbound` on a rolling window (no-op at this stage).
 
 **Key interfaces:**
 ```go
@@ -289,7 +303,6 @@ type Streamer interface {
 
 type StreamWriter interface {
     Write(delta string) error    // blocks on backpressure
-    Edit(index int, delta string) error
     Close() error
 }
 ```
@@ -318,13 +331,13 @@ type StreamWriter interface {
 **Scope:**
 - [ ] **Window management algorithm:**
   1. Fetch raw conversation history (Postgres), most-recent-first
-  2. Tokenise each message (model-specific tokeniser via `tiktoken-go` or model API)
+  2. Tokenise each message using the pluggable `Tokenizer` interface, selecting the implementation by `ModelID`
   3. Fill window from most-recent backwards until `max_tokens - reserved_output_tokens` budget is reached
   4. Inject persona system prompt at position 0 (always included, counts against budget)
   5. If long-term memory enabled: embed current user message → retrieve top-K similar past exchanges → inject as `<memory>` block after system prompt
   6. If RAG enabled: retrieve top-K documents → inject as `<context>` block
 - [ ] Redis working memory: fast key-value store for in-flight session state (e.g. pending tool calls, draft responses)
-- [ ] Postgres conversation memory: durable message log with configurable retention
+- [ ] Postgres conversation memory: durable message log with configurable retention (goose migration)
 - [ ] Vector store integration (pgvector default, Qdrant optional): embed and retrieve past exchanges
 - [ ] Persona config: per-bot system prompt stored in Postgres, loaded on context assembly
 
@@ -338,7 +351,7 @@ type AssembleOpts struct {
     RoomID        RoomID
     BotID         BotID
     UserMessage   Message
-    ModelID       string     // used to select tokeniser
+    ModelID       string     // selects the Tokenizer implementation
     MaxTokens     int
     ReserveOutput int
     RAGQuery      string     // empty = skip RAG
@@ -349,7 +362,7 @@ type AssembleOpts struct {
 - [ ] Insert 10,000-token conversation history; assert assembled context never exceeds `max_tokens`
 - [ ] Persona is always present at position 0 regardless of window truncation
 - [ ] Long-term memory retrieval returns semantically relevant messages, not just recent ones
-- [ ] Token count accuracy within ±5% of actual model tokeniser output
+- [ ] Token count accuracy within ±5% of actual model tokeniser output (tested per model implementation)
 
 **Definition of done:** A bot receives a context window that fits its model's token limit, contains the persona, and includes semantically relevant past exchanges when long-term memory is enabled.
 
@@ -357,11 +370,11 @@ type AssembleOpts struct {
 
 ### Stage 5 — Layer 5: Tool Runtime
 
-**Goal:** Bots can declare callable tools. The runtime validates arguments, executes safely, and injects results back into the LLM loop — automatically.
+**Goal:** Bots can declare callable tools. The runtime validates arguments, executes with timeout isolation, and injects results back into the LLM loop — automatically.
 
 **Scope:**
-- [ ] **Schema registry**: tools registered per workspace as JSON Schema. Stored in Postgres `tools(workspace_id, name, description, schema, endpoint, auth_config)`.
-- [ ] **Execution sandbox**: each tool call runs in an isolated goroutine with a configurable timeout (default 10s) and context cancellation. Tool handlers may be local Go functions (SDK) or remote HTTP endpoints.
+- [ ] **Schema registry**: tools registered per workspace as JSON Schema. Stored in Postgres `tools(workspace_id, name, description, schema, endpoint, auth_config)` (goose migration).
+- [ ] **Timeout-isolated execution**: each tool call runs in a dedicated goroutine with a configurable timeout (default 10s) and context cancellation. Tool handlers may be local Go functions (SDK) or remote HTTP endpoints. This provides timeout and cancellation isolation; it is not a security sandbox — untrusted tool handlers should be remote HTTP endpoints, not local Go functions.
 - [ ] **LLM loop**: when the LLM returns a `tool_call`, the runtime executes it, injects the `tool_result` back into the context, and re-calls the LLM — looping until the model returns a final text response.
 - [ ] **Streaming tool results**: tools may stream progress updates during execution. These appear as `ToolProgress` events on the client in real-time.
 - [ ] **Tool auth delegation**: tools can be called with the end-user's credentials (OAuth token forwarding), not the bot's credentials.
@@ -423,11 +436,11 @@ Room
 ```
 
 **Scope:**
-- [ ] **Agent registry**: agents registered per room with a role (`supervisor`, `worker`, `observer`) and a tool set. Stored in Postgres `agents(room_id, bot_id, role, tool_scope)`.
+- [ ] **Agent registry**: agents registered per room with a role (`supervisor`, `worker`, `observer`) and a tool set. Stored in Postgres `agents(room_id, bot_id, role, tool_scope)` (goose migration).
 - [ ] **Handoff protocol**: a supervisor agent produces a structured `Handoff{target_agent_id, task, context_slice}` message type. The runtime delivers it to the target agent's `OnHandoff` handler and blocks the supervisor pending the result.
-- [ ] **Shared memory graph**: a key-value scratchpad scoped to the room, readable and writable by all agents. Keys are namespaced by agent ID to avoid collisions. Conflicts resolved by last-write-wins with a vector clock for observability.
+- [ ] **Shared memory graph**: a key-value scratchpad scoped to the room, readable and writable by all agents. Keys are namespaced by agent ID to prevent accidental collisions. Writes are last-write-wins; a vector clock is recorded per key for observability. **Agents should not write to the same key from concurrent dispatch branches** — the vector clock makes conflicts visible in traces but does not merge them.
 - [ ] **Parallel execution**: supervisor can dispatch multiple handoffs simultaneously using `agent.Dispatch([]Handoff{})`, which fans out and collects results concurrently.
-- [ ] **Agent traces**: every agent decision, tool call, handoff, and memory write is recorded in an append-only `traces` table. Traces are queryable in real time by the developer dashboard.
+- [ ] **Agent traces**: every agent decision, tool call, handoff, and memory write is recorded in an append-only `traces` table (goose migration). Traces are queryable in real time by the developer dashboard.
 
 **Key interfaces:**
 ```go
@@ -475,18 +488,18 @@ researcher.OnHandoff(func(ctx context.Context, task *sdk.HandoffTask) sdk.Handof
 
 ### Stage 7 — Safety Plane
 
-**Goal:** Every message — human or agent, inbound or outbound — passes through a composable safety pipeline. No message bypasses it.
+**Goal:** Every message — human or agent, inbound or outbound — passes through a composable safety pipeline. No message bypasses it. This stage replaces the no-op passthrough installed in Stage 0 with real filter implementations.
 
 **Scope:**
-- [ ] **Pipeline model**: safety runs as a Go middleware chain, applied at the transport layer entry and exit points. Each filter returns `(modified_message, allow/block/redact, reason)`.
+- [ ] **Pipeline model**: safety runs as a Go middleware chain, called at the transport layer entry point (inbound) and inside the streaming engine (outbound, rolling window). Each filter returns `(modified_message, allow/block/redact, reason)`.
 - [ ] **Inbound filters** (applied before context assembly):
   - PII detection and redaction (names, emails, phone numbers, credit card patterns) — regex + NER model
   - Prompt injection detection (adversarial instructions in user input attempting to hijack the bot)
   - Content policy (configurable per workspace: profanity, hate speech, NSFW)
-- [ ] **Outbound filters** (applied before delivery to client):
+- [ ] **Outbound filters** (applied per rolling token window during streaming; full-response filters applied at stream close):
   - PII leak detection in AI responses
   - Policy re-check on generated content
-- [ ] **Audit log**: every safety decision (allow / block / redact) recorded in Postgres `safety_events(message_id, filter, action, reason, timestamp)`. Queryable via REST API and developer dashboard.
+- [ ] **Audit log**: every safety decision (allow / block / redact) recorded in Postgres `safety_events(message_id, filter, action, reason, timestamp)` (goose migration). Queryable via REST API and developer dashboard.
 - [ ] **Policy configuration**: per workspace, per room, per bot, with inheritance (room overrides workspace, bot overrides room).
 - [ ] **Fail-open vs fail-closed**: configurable per workspace. Default: fail-closed (block on filter error).
 
@@ -517,7 +530,29 @@ const (
 - [ ] Safety filter panic: verify fail-closed behaviour — message blocked, error logged, no panic propagation
 - [ ] Policy override: room-level policy stricter than workspace-level; verify room policy takes precedence
 
-**Definition of done:** All messages pass through the safety pipeline. A message blocked inbound never reaches the context engine. A message blocked outbound never reaches the client. Every decision is in the audit log.
+**Definition of done:** All messages pass through the safety pipeline with real filter implementations. A message blocked inbound never reaches the context engine. A message blocked outbound never reaches the client. Every decision is in the audit log.
+
+---
+
+### Stage 8 — SDK & Developer Experience
+
+**Goal:** The public SDK is polished, documented, and independently testable. Developers can integrate ConvKit without reading internal source.
+
+**Scope:**
+- [ ] `pkg/sdk` finalised with stable public API surface; all internal types unexported
+- [ ] SDK connects to ConvKit server over WebSocket — same transport as human clients, authenticated with API key
+- [ ] `sdk.NewBot`, `bot.OnMessage`, `bot.RegisterTool`, `bot.OnHandoff`, `bot.Start` fully implemented and tested in isolation against a test server
+- [ ] `docs/sdk-guide.md`: getting started guide, tool registration, streaming, multi-agent patterns
+- [ ] `examples/echo-bot`: minimal working bot, runnable with `go run . --api-key dev-key-1234`
+- [ ] `examples/tool-bot`: bot with a registered tool that calls a live HTTP endpoint
+- [ ] `examples/multi-agent`: supervisor + 2 workers completing a multi-step task
+
+**Tests:**
+- [ ] SDK integration test: echo bot connects, sends message, receives streamed reply — tested against embedded test server, no external dependencies
+- [ ] Tool registration and invocation round-trip via SDK
+- [ ] SDK reconnect: server restarts mid-stream; SDK reconnects and receives replay
+
+**Definition of done:** A developer can clone the repo, run `make dev`, and have a working bot connected and responding in under 10 minutes using only `docs/sdk-guide.md`.
 
 ---
 
@@ -540,21 +575,24 @@ All signals are compatible with the standard LGTM stack (Grafana + Loki + Tempo)
 
 | Decision | V1 Choice | Rationale | Future Option |
 |---|---|---|---|
+| Deployment topology | Single binary | Eliminates distributed systems complexity before it's needed; clean package boundaries make future splitting straightforward | Split coordinator + shard nodes when load demands horizontal room scaling |
 | Message fan-out | NATS JetStream | Low operational overhead, at-least-once, built-in replay | Kafka for higher throughput at scale |
 | Streaming protocol | SSE delta over WebSocket | Simpler reconnect semantics; HTTP/2 framing handles flow control | WebTransport when browser support matures |
+| Tokenizer | Pluggable interface, per-model implementations | Model-agnostic; tiktoken-go for OpenAI models, character estimate as fallback; `ModelID` selects at runtime | First-party tokenizer APIs as they become available |
 | Context window mgmt | Token-counting + recency | Deterministic, model-agnostic | Learned context compression |
-| Tool execution | Goroutine per call + timeout | Go's goroutine model is near-zero overhead | WASM sandbox for untrusted tools |
-| Memory graph conflicts | Last-write-wins + vector clock | Simple to implement correctly | CRDTs for true concurrent merge |
+| Tool execution | Goroutine per call + timeout | Go's goroutine model is near-zero overhead; provides cancellation isolation for trusted handlers | Remote HTTP endpoints for untrusted tools; WASM sandbox as a future option |
+| Memory graph conflicts | Last-write-wins + vector clock | Simple to implement correctly; vector clock makes conflicts visible in traces | CRDTs for true concurrent merge |
 | Multi-agent routing | Explicit handoff (pull) | Auditable, no surprise concurrency | Event-driven (push) for reactive agents |
-| Safety pipeline | Middleware chain, fail-closed | Composable, testable, no message bypasses | ML-based policy scoring |
+| Safety pipeline | Middleware chain, fail-closed, no-op from Stage 0 | Composable, testable; every layer plugs in from day one | ML-based policy scoring |
 | LLM provider | Provider-agnostic interface | Apps bring their own LLM | Optional hosted inference via partner API |
+| Database migrations | goose | Versioned, auditable schema changes applied on startup | — |
 
 ---
 
 ## Running Locally
 
 ```bash
-# Start the full stack (coordinator + 3 shards + Redis + Postgres + NATS)
+# Start the full stack (server + Redis + Postgres + NATS)
 make dev
 
 # Run all tests
@@ -563,7 +601,7 @@ make test
 # Run benchmarks
 make bench
 
-# Connect the example bot
+# Connect the example echo bot
 cd examples/echo-bot && go run . --api-key dev-key-1234
 
 # Open the developer dashboard
@@ -574,18 +612,20 @@ open http://localhost:8080/dashboard
 
 ## Non-Goals (V1)
 
+- **Horizontal scaling** — V1 is a single-process server. Vertical scaling handles growth until a multi-node architecture is actually warranted.
 - **Multi-tenancy isolation at the infrastructure level** — V1 uses workspace IDs as logical isolation; hard infrastructure isolation (separate clusters per tenant) is a V2 concern.
 - **On-premise LLM hosting** — ConvKit routes to any provider-agnostic LLM interface; it does not bundle model weights.
 - **Voice / audio transport** — text and structured data only in V1.
 - **Mobile SDKs (iOS / Android)** — V1 ships a Go SDK and a REST/WebSocket protocol spec. Community-maintained mobile SDKs can be built against the protocol.
+- **Billing / token metering** — usage tracking per workspace is distinct from the token budget feature and is a V2 concern.
 
 ---
 
 ## References
 
 - [NATS JetStream docs](https://docs.nats.io/nats-concepts/jetstream)
-- [nhooyr/websocket — Go WebSocket library](https://github.com/nhooyr/websocket)
+- [coder/websocket — maintained Go WebSocket library](https://github.com/coder/websocket)
 - [pgvector — vector similarity in Postgres](https://github.com/pgvector/pgvector)
 - [OpenTelemetry Go](https://opentelemetry.io/docs/languages/go/)
-- [tiktoken-go — OpenAI tokeniser in Go](https://github.com/pkoukk/tiktoken-go)
+- [goose — database migration tool](https://github.com/pressly/goose)
 - [JSON Schema — tool argument validation](https://json-schema.org/)
