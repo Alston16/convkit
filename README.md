@@ -201,18 +201,18 @@ The safety plane is introduced as a **no-op passthrough in Stage 0** so every su
 **Goal:** Working repository, shared types, and a safety plane skeleton that every later layer can plug into from the start.
 
 **Deliverables:**
-- [ ] Go module initialised: `github.com/yourorg/convkit`
-- [ ] Core domain types defined in `internal/common`:
+- [x] Go module initialised: `github.com/yourorg/convkit`
+- [x] Core domain types defined in `internal/common`:
   - `RoomID`, `UserID`, `BotID`, `MessageID`
   - `Message{ID, RoomID, SenderID, Body, CreatedAt, Metadata}`
   - `StreamToken{MessageID, Delta, Index, Done}`
   - `ToolCall{ID, Name, Arguments json.RawMessage}`
   - `ToolResult{CallID, Output json.RawMessage, Error string}`
-- [ ] **Safety plane skeleton** in `internal/safety`: `SafetyPipeline` interface defined; default implementation is a no-op passthrough. All layers will call `RunInbound` / `RunOutbound` from their first commit — the no-op means no behaviour change until Stage 7.
-- [ ] **Pluggable tokenizer interface** in `pkg/tokenizer`: `Tokenizer` interface with `CountTokens(model, text string) int`. Implementations for OpenAI (tiktoken-go) and a character-estimate fallback. Model ID selects the implementation at runtime.
-- [ ] **Migration baseline**: `goose` configured; initial empty schema migration in `migrations/`.
-- [ ] Docker Compose environment: single server + Redis + Postgres + NATS
-- [ ] `make dev` brings the full environment up; `make test` runs all unit tests
+- [x] **Safety plane skeleton** in `internal/safety`: `SafetyPipeline` interface defined; default implementation is a no-op passthrough. All layers will call `RunInbound` / `RunOutbound` from their first commit — the no-op means no behaviour change until Stage 7.
+- [x] **Pluggable tokenizer interface** in `pkg/tokenizer`: `Tokenizer` interface with `CountTokens(model, text string) int`. Implementations for OpenAI (tiktoken-go) and a character-estimate fallback. Model ID selects the implementation at runtime.
+- [x] **Migration baseline**: `goose` configured; initial empty schema migration in `migrations/`.
+- [x] Docker Compose environment: single server + Redis + Postgres + NATS
+- [x] `make dev` brings the full environment up; `make test` runs all unit tests
 
 **Definition of done:** `go test ./...` passes. Server process starts and the health endpoint returns `200 OK`. Safety plane no-op passthrough is callable from all layer stubs.
 

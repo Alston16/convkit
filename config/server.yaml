@@ -1,0 +1,11 @@
+server:
+  port: 8080
+
+postgres:
+  dsn: "postgres://convkit:convkit@postgres:5432/convkit?sslmode=disable"
+
+redis:
+  addr: "redis:6379"
+
+nats:
+  url: "nats://nats:4222"
